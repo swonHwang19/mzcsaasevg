@@ -1,0 +1,221 @@
+public without sharing class IF_SFDC_JIRA_CREATE_ISSUE implements Queueable{
+    private List<Opportunity> opps;
+    private static Boolean nextQu = false;
+    private static final String projectKey = 'CTC';
+    private static final String salesforceBaseUrl = System.URL.getSalesforceBaseUrl().toExternalForm();
+
+    public IF_SFDC_JIRA_CREATE_ISSUE(List<Opportunity> opps) {
+        this.opps = opps;
+    }
+
+    public void execute(QueueableContext ctx) {
+        List<String> ids = new List<String>();
+        for (Opportunity opportunity : opps) {
+            ids.add(opportunity.Id);
+        }
+        callout(ids);
+    }
+
+    @Future(Callout=true)
+    public static void callout(List<String> ids) {
+        // Prepare the request body for bulk issue creation
+        List<Opportunity> opps = [
+                SELECT name, Description, Account.Name, ContractStartDate__c, Owner.Team__c,
+                        Owner.Name,Owner.Email, Customer_Business_Requirement__c, Customer_Technical_Requirement__c
+                FROM Opportunity
+                WHERE ID IN :ids];
+
+        Map<Id, List<OpportunityTeamMember>> teamMemberMap = getTeamMemberMap(ids);
+
+        JiraSetting__c jiraSetting = [SELECT authToken__c, baseUrl__c, projectName__c, userName__c
+                                      FROM JiraSetting__c
+                                      WHERE projectName__c = :projectKey];
+        String username = jiraSetting.userName__c;
+        String authString = username + ':' + jiraSetting.authToken__c;
+        String encodeAuth = EncodingUtil.base64Encode(Blob.valueOf(authString));
+
+        JiraJson jiraJson = new JiraJson();
+        jiraJson.issueUpdates = new List<JiraJson.cls_issueUpdates>();
+
+        for (Opportunity opp : opps) {
+            String opptyUrl = salesforceBaseUrl + '/lightning/r/Opportunity/' + opp.Id + '/view';
+            String membersStr = getMembersStr(teamMemberMap, opp);
+            String descriptionStringToJson = '1. 고객사명 : ' + opp.Account.Name + '\n'
+                    + '2. 영업기회명 : ' + opp.Name + '\n'
+                    + '3. 영업기회링크 : ' + '\n'
+                    + opptyUrl + '\n'
+                    + '4. 영업기회 정보 : ' + Util.stringNullToBlank(opp.Description) + '\n'
+                    + '5. 사업 요구사항 : ' + Util.stringNullToBlank(opp.Customer_Business_Requirement__c) + '\n'
+                    + '6. 기술 요구사항 : ' + Util.stringNullToBlank(opp.Customer_Technical_Requirement__c) + '\n'
+                    + '7. 영업기회 담당자명 : ' + Util.stringNullToBlank(opp.Owner.Name) + '\n'
+                    + '8. 영업기회 담당자팀 : ' + Util.stringNullToBlank(opp.Owner.Team__c) + '\n'
+                    + '9. 영업기회 담당자 이메일 : ' + Util.stringNullToBlank(opp.Owner.Email) + '\n'
+                    + '10. 영업지원 요청일 : ' + String.valueOf(Date.today()) + '\n';
+                    //+ '11. 영업기회 팀원 : \n' + membersStr;
+
+            JiraJson.cls_issueUpdates issueUpdate = new JiraJson.cls_issueUpdates();
+            issueUpdate.fields = new JiraJson.cls_fields();
+            issueUpdate.fields.project = new JiraJson.cls_project();
+            issueUpdate.fields.project.key = jiraSetting.projectName__c;
+            issueUpdate.fields.summary = '[' + opp.Account.Name + '] ' + opp.Name;
+            issueUpdate.fields.description = convertToJiraJsonDescription(descriptionStringToJson);
+            issueUpdate.fields.issuetype = new JiraJson.cls_issuetype();
+            issueUpdate.fields.issuetype.name = 'Epic';
+            issueUpdate.fields.assignee = new JiraJson.cls_assignee();
+            issueUpdate.fields.assignee.name = username;
+
+            issueUpdate.fields.customfield_11802 = String.valueOf(Date.today());
+            issueUpdate.fields.customfield_12319 = opp.Account.Name;
+            issueUpdate.fields.customfield_12295 = opp.Owner.Name;
+            issueUpdate.fields.customfield_12297 = new JiraJson.customfield_12297();
+            issueUpdate.fields.customfield_12297.id = '11620'; //단기
+            issueUpdate.fields.customfield_12296 = new JiraJson.customfield_12296();
+            issueUpdate.fields.customfield_12296.id = '12006'; //None
+            issueUpdate.fields.customfield_12298 = new JiraJson.customfield_12298();
+            issueUpdate.fields.customfield_12298.id = '11622'; //External
+            List<JiraJson.customfield_12328> projectAreas = new List<jiraJson.customfield_12328>();
+            JiraJson.customfield_12328 customfield12328 = new JiraJson.customfield_12328();
+            customfield12328.id = '11713'; //Nonprofit
+            projectAreas.add(customfield12328);
+            issueUpdate.fields.customfield_12328 =projectAreas;
+            issueUpdate.fields.customfield_12317 = opptyUrl; //SFDC LINK
+
+            jiraJson.issueUpdates.add(issueUpdate);
+        }
+        // Convert the request body to JSON format
+        String requestBodyJson = JSON.serialize(jiraJson);
+
+        //removeNullValues
+        String reqBody = Util.removeNullValues(requestBodyJson);
+
+        // Create the HTTP request object
+        HttpRequest request = new HttpRequest();
+        request.setEndpoint(jiraSetting.baseUrl__c + '/rest/api/3/issue/bulk');
+        request.setMethod('POST');
+        request.setHeader('Content-Type', 'application/json');
+        request.setHeader('Authorization', 'Basic ' + encodeAuth);
+        request.setBody(reqBody);
+
+        // Send the HTTP request and get the response
+        Http http = new Http();
+        HttpResponse response = http.send(request);
+
+        // Handle the response
+        if (response.getStatusCode() != 201) {
+            // Error handling
+            System.debug('JIRA REST API callout failed with status code: ' + response.getStatusCode());
+            System.debug('Response body: ' + response.getBody());
+            System.debug('Request body: ' + requestBodyJson);
+            Map<String, Object> requestBodyResult = (Map<String, Object>) JSON.deserializeUntyped(request.getBody());
+
+            String jsonSerializePretty2 = JSON.serializePretty(requestBodyResult);
+            System.debug('Request body: ' + jsonSerializePretty2);
+        } else {
+            JiraResponse jiraResponse = JiraResponse.parse(response.getBody());
+            JiraResponse.cls_issues[] issueResponses = jiraResponse.issues;
+            List<Opportunity> updateOpportunities = new List<Opportunity>();
+            for (Integer i = 0; i < ids.size(); i++) {
+                Opportunity opp = new Opportunity();
+                opp.Id = ids[i];
+                opp.jira_issue_id__c = issueResponses[i].id;
+                updateOpportunities.add(opp);
+            }
+            update updateOpportunities;
+            nextQu = true;
+
+            Map<String, Object> requestBodyResult = (Map<String, Object>) JSON.deserializeUntyped(request.getBody());
+            System.debug('Response body: ' + jiraResponse);
+            String jsonSerializePretty2 = JSON.serializePretty(requestBodyResult);
+            System.debug('Request body: ' + jsonSerializePretty2);
+
+            if (!Test.isRunningTest()) {
+                System.enqueueJob(new IF_SFDC_JIRA_UPDATE_ISSUE_FILE(ids));
+            }
+        }
+    }
+
+
+    private static String getMembersStr(Map<Id, List<OpportunityTeamMember>> teamMemberMap, Opportunity opp) {
+        String membersStr = '';
+        List<OpportunityTeamMember> opportunityTeamMembers = teamMemberMap.get(opp.Id);
+        if (opportunityTeamMembers != null) {
+            for (OpportunityTeamMember member : opportunityTeamMembers) {
+                membersStr += '\t' + member.TeamMemberRole + ' - ' + member.Name + '\n';
+            }
+        }
+        return membersStr;
+    }
+
+    private static Map<Id, List<OpportunityTeamMember>> getTeamMemberMap(List<String> ids) {
+        List<OpportunityTeamMember> teamMembers = [
+                SELECT OpportunityId, Name, TeamMemberRole
+                FROM OpportunityTeamMember
+                WHERE OpportunityId IN :ids
+        ];
+        Map<Id, List<OpportunityTeamMember>> teamMemberMap = new Map<Id, List<OpportunityTeamMember>>();
+        for (OpportunityTeamMember member : teamMembers) {
+            Id oppId = member.OpportunityId;
+            if (teamMemberMap.get(oppId) != null) {
+                List<OpportunityTeamMember> oldList = teamMemberMap.get(oppId);
+                oldList.add(member);
+                teamMemberMap.put(oppId, oldList);
+            } else {
+                List<OpportunityTeamMember> members = new List<OpportunityTeamMember>();
+                members.add(member);
+                teamMemberMap.put(oppId, members);
+            }
+        }
+        return teamMemberMap;
+    }
+
+    // Atlassian 문서 형식으로 변환하는 메서드
+    private static JiraJson.cls_description convertToJiraJsonDescription(String text) {
+        JiraJson.cls_description description = new JiraJson.cls_description();
+        description.type = 'doc';
+        description.version = 1;
+        description.content = new List<JiraJson.cls_content>();
+
+        // 각 줄마다 paragraph 객체 생성
+        for (String line : text.split('\n')) {
+            JiraJson.cls_content paragraph = new JiraJson.cls_content();
+            paragraph.type = 'paragraph';
+            paragraph.content = new List<JiraJson.cls_content>();
+
+            List<String> words = line.split(' ');
+            for(String word : words) {
+                JiraJson.cls_content textMap = new JiraJson.cls_content();
+                textMap.type = 'text';
+
+                if(word.startsWith('http')) { //HTTP 링크를 바로가기 링크로 변환
+                    JiraJson.cls_marks link = new JiraJson.cls_marks();
+                    link.type = 'link';
+                    link.attrs = new JiraJson.cls_attrs();
+                    link.attrs.href = word;
+                    textMap.text = '[바로가기]';
+                    textMap.marks = new List<JiraJson.cls_marks>{link};
+                } else {
+                    if (word == '') {
+                        word = ' ';
+                    }
+                    textMap.text = word;
+                }
+
+                paragraph.content.add(textMap);
+
+                JiraJson.cls_content content = new JiraJson.cls_content();
+                content.type = 'text';
+                content.text = ' ';
+                paragraph.content.add(content); //공백을 추가하여 단어 구분
+            }
+            paragraph.content.remove(paragraph.content.size()-1); //마지막 공백 제거
+
+            description.content.add(paragraph);
+        }
+        return description;
+    }
+
+
+
+
+
+}
